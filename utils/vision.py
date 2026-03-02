@@ -1,226 +1,220 @@
-# utils/vision.py
-# ─────────────────────────────────────────────────────────────
-# Food detection from images using Groq Llama 4 Scout (vision).
-# Fallback: HuggingFace Qwen2-VL if Groq fails or USE_HF_FALLBACK=true
-# ─────────────────────────────────────────────────────────────
+# utils/vision.py — Food detection from images.
+#
+# Meal photo providers:
+#   "groq"   → Groq Llama 4 Scout 17B  (fast, free, default)
+#   "gemini" → Google Gemini 1.5 Flash  (accurate, free tier)
+#   "qwen2"  → Qwen2-VL 7B via HuggingFace (needs HF_TOKEN, 10-30s)
+#
+# Food label providers: "groq" | "gemini" only
+#   (Qwen2 excluded — unreliable for precise number extraction)
+#
+# Fallback: selected provider → groq → raise
 
-import os
-import re
-import json
-import base64
-import logging
+import os, re, io, json, base64, logging
 from groq import Groq
-
 logger = logging.getLogger(__name__)
 
-# ── Prompt ────────────────────────────────────────────────────
-DETECTION_SYSTEM_PROMPT = """You are a precise food detection assistant.
-Your job is to identify all food items visible in an image and return structured JSON.
-Return ONLY valid JSON. No prose, no markdown, no explanation."""
+# ── Prompts ───────────────────────────────────────────────────
+UTENSIL_CONTEXT = """
+UTENSIL SIZE REFERENCE:
+- Small katori/bowl : 100-120 ml → 80-100 g food
+- Medium katori/bowl: 150-200 ml → 120-160 g food
+- Large bowl        : 300-400 ml → 250-320 g food
+- Standard plate    : estimate each item separately
+- Tablespoon: ~15 g | Teaspoon: ~5 g
+Per-piece weights:
+- 1 roti/chapati: 40g | 1 paratha: 80g | 1 naan: 90g | 1 idli: 40g | 1 dosa: 80g
+- 1 medium tomato: 120g | 1 medium onion: 100g | 1 medium cucumber: 150g | 1 capsicum: 120g
+Steps: (1) identify container, (2) estimate fill %, (3) capacity × fill × 0.85 = grams
+"""
 
-DETECTION_USER_PROMPT = """Analyze this image and list every food item visible.
+SYSTEM_PROMPT = (
+    "You are a precise food detection assistant specialising in Indian and international cuisine. "
+    "Return ONLY valid JSON — no prose, no markdown, no explanation."
+)
 
-Return a JSON array where each object has exactly these fields:
-- food_name: string (specific food name, e.g. "samosa" not "snack")
-- portion_size: float (estimated quantity)
-- portion_unit: string (one of: "piece", "cup", "bowl", "grams", "slice", "tablespoon")
-- confidence: float between 0 and 1 (how certain you are about this item)
-- visual_description: string (one sentence describing what you see)
+USER_PROMPT = """Examine this image and list every food item visible.
 
-Example output:
+RULES:
+1. Be SPECIFIC: 'tomato raw' not 'vegetable', 'okra' not 'green vegetable', 'white rice' not 'food'
+2. Raw salad: one JSON object per vegetable, not one object for the whole salad
+3. Thali/mixed plate: one object per item/katori
+4. Use UTENSIL CONTEXT below to estimate grams — container first, then fill level
+5. confidence >= 0.85 ONLY when certain of BOTH identity AND portion size
+6. NEVER label okra/lady finger as 'finger food' or any non-vegetable
+7. NEVER label tomato as 'basil' or any herb
+
+""" + UTENSIL_CONTEXT + """
+
+Each JSON object must have EXACTLY these fields:
+  food_name         : "specific name e.g. tomato raw, okra cooked, white rice"
+  container_type    : "small katori|medium katori|large bowl|plate|piece|none"
+  fill_level        : "25%|50%|75%|full|n/a"
+  portion_size      : <float>
+  portion_unit      : "piece|cup|bowl|grams|slice|tablespoon"
+  confidence        : <float 0-1>
+  visual_description: "one sentence"
+
+Example:
 [
-  {
-    "food_name": "dal tadka",
-    "portion_size": 1,
-    "portion_unit": "bowl",
-    "confidence": 0.92,
-    "visual_description": "A bowl of yellow lentil dal with tempering visible on top."
-  },
-  {
-    "food_name": "roti",
-    "portion_size": 2,
-    "portion_unit": "piece",
-    "confidence": 0.95,
-    "visual_description": "Two whole wheat rotis on the side of the plate."
-  }
+  {"food_name":"tomato raw","container_type":"medium bowl","fill_level":"n/a","portion_size":100,"portion_unit":"grams","confidence":0.88,"visual_description":"Diced red tomato pieces in a salad bowl."},
+  {"food_name":"cucumber raw","container_type":"medium bowl","fill_level":"n/a","portion_size":75,"portion_unit":"grams","confidence":0.90,"visual_description":"Sliced cucumber in the same bowl."}
 ]
 
-If no food is visible, return an empty array: []
-Return ONLY the JSON array. Nothing else."""
+If no food visible return: []
+Return ONLY the JSON array."""
 
 
-def detect_foods(image_bytes: bytes, mime_type: str = "image/jpeg") -> list[dict]:
-    """
-    Detect food items from image bytes.
+def detect_foods(image_bytes: bytes, mime_type: str = "image/jpeg",
+                 provider: str = "groq") -> list[dict]:
+    """Detect food items. provider: 'groq'|'gemini'|'qwen2'"""
+    b64      = base64.b64encode(image_bytes).decode()
+    data_url = f"data:{mime_type};base64,{b64}"
+    logger.info(f"[vision] provider='{provider}'")
 
-    Returns list of dicts with keys:
-        food_name, portion_size, portion_unit, confidence, visual_description
-
-    Raises:
-        RuntimeError if both Groq and HuggingFace fallback fail
-    """
-    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-    data_url = f"data:{mime_type};base64,{image_b64}"
-
-    use_hf = os.getenv("USE_HF_FALLBACK", "false").lower() == "true"
-
-    if not use_hf:
+    if provider == "gemini":
         try:
-            logger.info("[vision] Calling Groq Llama 4 Scout for food detection")
-            result = _groq_detect(data_url)
-            logger.info(f"[vision] Groq detected {len(result)} item(s)")
-            return result
+            return _gemini(b64, mime_type)
         except Exception as e:
-            logger.warning(f"[vision] Groq detection failed: {e} — switching to HuggingFace fallback")
+            logger.warning(f"[vision] Gemini failed: {e} → Groq fallback")
 
-    # HuggingFace fallback
-    logger.info("[vision] Using HuggingFace Qwen2-VL fallback")
-    return _hf_detect(image_b64)
+    elif provider == "qwen2":
+        try:
+            return _qwen2(b64, mime_type)
+        except Exception as e:
+            logger.warning(f"[vision] Qwen2-VL failed: {e} → Groq fallback")
+
+    return _groq(data_url)   # default / fallback
 
 
-def _groq_detect(data_url: str) -> list[dict]:
-    """Call Groq Llama 4 Scout with image."""
+def _groq(data_url: str) -> list[dict]:
     client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-
-    response = client.chat.completions.create(
+    r = client.chat.completions.create(
         model="meta-llama/llama-4-scout-17b-16e-instruct",
         messages=[
-            {"role": "system", "content": DETECTION_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": data_url}},
-                    {"type": "text", "text": DETECTION_USER_PROMPT},
-                ],
-            },
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": [
+                {"type": "image_url", "image_url": {"url": data_url}},
+                {"type": "text",      "text": USER_PROMPT},
+            ]},
         ],
-        max_tokens=1024,
-        temperature=0.1,
+        max_tokens=2048, temperature=0.1,
     )
+    raw = r.choices[0].message.content.strip()
+    logger.debug(f"[vision:groq] {raw[:200]}")
+    return _parse(raw)
 
-    raw = response.choices[0].message.content.strip()
-    logger.debug(f"[vision] Groq raw response: {raw[:300]}...")
-    return _parse_detection_response(raw)
+
+def _gemini(b64: str, mime_type: str) -> list[dict]:
+    try:
+        import google.generativeai as genai
+        import PIL.Image
+    except ImportError:
+        raise RuntimeError("Run: pip install google-generativeai pillow")
+
+    key = os.getenv("GEMINI_API_KEY", "")
+    if not key:
+        raise RuntimeError("GEMINI_API_KEY not set in .env")
+
+    genai.configure(api_key=key)
+    model  = genai.GenerativeModel("gemini-1.5-flash")
+    img    = PIL.Image.open(io.BytesIO(base64.b64decode(b64)))
+    r      = model.generate_content([img, SYSTEM_PROMPT + "\n\n" + USER_PROMPT])
+    raw    = r.text.strip()
+    logger.debug(f"[vision:gemini] {raw[:200]}")
+    return _parse(raw)
 
 
-def _hf_detect(image_b64: str) -> list[dict]:
-    """HuggingFace Qwen2-VL fallback."""
-    import requests
+def _qwen2(b64: str, mime_type: str) -> list[dict]:
+    """Qwen2-VL 7B via HuggingFace Serverless Inference API. Needs HF_TOKEN."""
+    import requests as rq
 
-    hf_token = os.getenv("HF_TOKEN", "")
-    if not hf_token:
+    token = os.getenv("HF_TOKEN", "")
+    if not token:
         raise RuntimeError(
-            "HF_TOKEN not set. Add it to your .env file to use HuggingFace fallback."
+            "HF_TOKEN not set in .env — get a free token at huggingface.co/settings/tokens"
         )
 
-    headers = {"Authorization": f"Bearer {hf_token}"}
-    payload = {
-        "inputs": {
-            "image": image_b64,
-            "text": DETECTION_USER_PROMPT,
-        }
-    }
-
-    resp = requests.post(
+    resp = rq.post(
         "https://api-inference.huggingface.co/models/Qwen/Qwen2-VL-7B-Instruct",
-        headers=headers,
-        json=payload,
-        timeout=60,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json={
+            "inputs": {
+                "image": f"data:{mime_type};base64,{b64}",
+                "text":  SYSTEM_PROMPT + "\n\n" + USER_PROMPT,
+            },
+            "parameters": {"max_new_tokens": 2048},
+        },
+        timeout=90,
     )
 
+    if resp.status_code == 503:
+        raise RuntimeError("Qwen2-VL is loading (cold start). Wait ~20s and retry.")
     if resp.status_code != 200:
-        raise RuntimeError(f"HuggingFace API error {resp.status_code}: {resp.text[:200]}")
+        raise RuntimeError(f"HuggingFace {resp.status_code}: {resp.text[:200]}")
 
-    raw = resp.json()
-    # HF returns list with generated_text key
-    text = raw[0].get("generated_text", "") if isinstance(raw, list) else str(raw)
-    logger.debug(f"[vision] HuggingFace raw response: {text[:300]}...")
-    return _parse_detection_response(text)
+    data = resp.json()
+    text = (data[0].get("generated_text", "") if isinstance(data, list)
+            else data.get("generated_text", str(data)))
+    logger.debug(f"[vision:qwen2] {text[:200]}")
+    return _parse(text)
 
 
-def _parse_detection_response(raw: str) -> list[dict]:
-    """
-    Parse model output into structured list.
-    Three-layer fallback:
-      1. Direct json.loads
-      2. Regex extraction of JSON array
-      3. Ask Groq text model to fix malformed JSON
-    """
-    # Layer 1: direct parse
+def _parse(raw: str) -> list[dict]:
+    """3-layer JSON parsing: direct → regex → Groq reformat."""
+    # Layer 1
     try:
-        data = json.loads(raw)
-        if isinstance(data, list):
-            return _validate_items(data)
+        d = json.loads(raw)
+        if isinstance(d, list): return _validate(d)
     except json.JSONDecodeError:
-        logger.debug("[vision] Direct JSON parse failed, trying regex")
-
-    # Layer 2: regex extraction
+        pass
+    # Layer 2
     try:
-        match = re.search(r'\[.*?\]', raw, re.DOTALL)
-        if match:
-            data = json.loads(match.group())
-            if isinstance(data, list):
-                return _validate_items(data)
+        m = re.search(r"\[.*\]", raw, re.DOTALL)
+        if m:
+            d = json.loads(m.group())
+            if isinstance(d, list): return _validate(d)
     except json.JSONDecodeError:
-        logger.debug("[vision] Regex extraction failed, trying Groq reformat")
-
-    # Layer 3: ask Groq to fix it
+        pass
+    # Layer 3: Groq reformat
+    logger.warning("[vision] Bad JSON — Groq reformat attempt")
     try:
-        logger.warning("[vision] Attempting Groq JSON reformat as last resort")
         client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-        fix_response = client.chat.completions.create(
+        fix = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
-                {"role": "system", "content": "You fix malformed JSON. Return only valid JSON, nothing else."},
-                {"role": "user", "content": f"Fix this into a valid JSON array of food objects:\n{raw}"},
+                {"role": "system", "content": "Convert to valid JSON array of food objects. Return ONLY the array."},
+                {"role": "user",   "content": raw[:3000]},
             ],
-            max_tokens=1024,
-            temperature=0,
+            max_tokens=2048, temperature=0,
         )
-        fixed = fix_response.choices[0].message.content.strip()
-        data = json.loads(fixed)
-        if isinstance(data, list):
-            return _validate_items(data)
+        d = json.loads(fix.choices[0].message.content.strip())
+        if isinstance(d, list): return _validate(d)
     except Exception as e:
-        logger.error(f"[vision] All JSON parsing layers failed: {e}")
-
-    logger.error("[vision] Could not parse model response — returning empty list")
+        logger.error(f"[vision] All JSON parsing failed: {e}")
     return []
 
 
-def _validate_items(items: list) -> list[dict]:
-    """Ensure each item has required fields with sensible defaults."""
-    valid = []
-    required = ["food_name", "portion_size", "portion_unit", "confidence", "visual_description"]
+def _validate(items: list) -> list[dict]:
     valid_units = {"piece", "cup", "bowl", "grams", "slice", "tablespoon"}
-
+    out = []
     for item in items:
-        if not isinstance(item, dict):
-            logger.warning(f"[vision] Skipping non-dict item: {item}")
-            continue
-
-        # Apply defaults for missing fields
-        item.setdefault("food_name", "unknown food")
-        item.setdefault("portion_size", 1.0)
-        item.setdefault("portion_unit", "piece")
-        item.setdefault("confidence", 0.5)
-        item.setdefault("visual_description", "No description available")
-
-        # Clamp confidence to 0-1
-        item["confidence"] = max(0.0, min(1.0, float(item["confidence"])))
-
-        # Normalise unit
+        if not isinstance(item, dict): continue
+        item.setdefault("food_name",          "unknown food")
+        item.setdefault("container_type",     "unknown")
+        item.setdefault("fill_level",         "n/a")
+        item.setdefault("portion_size",       1.0)
+        item.setdefault("portion_unit",       "piece")
+        item.setdefault("confidence",         0.5)
+        item.setdefault("visual_description", "")
+        item["confidence"]   = max(0.0, min(1.0, float(item["confidence"])))
+        item["portion_size"] = max(0.01, float(item["portion_size"]))
         if item["portion_unit"] not in valid_units:
-            logger.warning(f"[vision] Unknown unit '{item['portion_unit']}' for '{item['food_name']}' — defaulting to 'piece'")
             item["portion_unit"] = "piece"
-
-        # Convert portion_size to float
-        try:
-            item["portion_size"] = float(item["portion_size"])
-        except (ValueError, TypeError):
-            item["portion_size"] = 1.0
-
-        valid.append(item)
-        logger.debug(f"[vision] Validated item: {item['food_name']} | {item['portion_size']} {item['portion_unit']} | conf={item['confidence']}")
-
-    return valid
+        logger.debug(
+            f"[vision] ✓ {item['food_name']} | "
+            f"{item['portion_size']} {item['portion_unit']} | "
+            f"{item['confidence']:.0%} | {item['container_type']} {item['fill_level']}"
+        )
+        out.append(item)
+    return out

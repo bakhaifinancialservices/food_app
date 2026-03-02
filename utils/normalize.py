@@ -98,6 +98,38 @@ FOOD_NAME_MAP = {
     "nimbu pani":       "lemonade",
     "coconut water":    "coconut water",
 
+    # ── Okra / Lady finger (common confusion with ladyfinger cookie) ──
+    "okra":             "okra raw",
+    "okra raw":         "okra raw",
+    "okra cooked":      "okra cooked",
+    "lady finger":      "okra raw",      # Indian English name
+    "ladyfinger":       "okra raw",      # same — NOT the dessert cookie
+    "ladies finger":    "okra raw",
+    "bhindi":           "okra cooked",
+    "bhindi masala":    "okra cooked",
+
+    # ── Raw salad vegetables ──────────────────────────────────
+    "tomato":           "tomatoes raw",
+    "tomato raw":       "tomatoes raw",
+    "cherry tomato":    "tomatoes cherry raw",
+    "cucumber":         "cucumber raw",
+    "cucumber raw":     "cucumber raw",
+    "capsicum":         "peppers sweet green raw",
+    "green capsicum":   "peppers sweet green raw",
+    "red capsicum":     "peppers sweet red raw",
+    "bell pepper":      "peppers sweet green raw",
+    "onion":            "onions raw",
+    "red onion":        "onions red raw",
+    "spring onion":     "onions spring raw",
+    "lettuce":          "lettuce raw",
+    "spinach":          "spinach raw",
+    "carrot":           "carrots raw",
+    "beetroot":         "beets raw",
+    "radish":           "radishes raw",
+    "corn":             "corn sweet cooked",
+    "sweet corn":       "corn sweet cooked",
+    "mixed salad":      "salad mixed greens",
+
     # ── Common international foods ────────────────────────────
     "pasta":            "pasta cooked",
     "pizza":            "pizza",
@@ -166,6 +198,8 @@ def _groq_normalize(food_name: str) -> str:
                     "content": (
                         f"What is the standard USDA nutritional database search term for: '{food_name}' "
                         "as typically eaten in an Indian meal context? "
+                        "IMPORTANT: 'lady finger' and 'ladyfinger' means OKRA (the vegetable), NOT the cookie. "
+                        "'tomato' means the red fruit/vegetable, NOT basil or any herb. "
                         "Reply with just the food name, 1-5 words only."
                     ),
                 },

@@ -235,6 +235,166 @@ except Exception as e:
     record("Groq Llama 4 Scout available", False, f"Error: {e}")
 
 
+
+
+
+# ─────────────────────────────────────────────────────────────
+# 8. LABEL OCR — serving_calculator logic (no API)
+# ─────────────────────────────────────────────────────────────
+print("\n" + "═"*60)
+print("SCENARIO 8: Label OCR — serving_calculator")
+print("═"*60)
+
+from utils.label_ocr import serving_calculator
+
+mock_label = {
+    "calories_kcal":150,"total_fat_g":6.0,"saturated_fat_g":2.0,
+    "carbohydrates_g":20.0,"fiber_g":1.5,"sugar_g":8.0,"protein_g":3.0,
+    "sodium_mg":200.0,"calcium_mg":None,"iron_mg":None,
+    "potassium_mg":None,"vit_a_mcg":None,"vit_c_mg":None,"vit_d_mcg":None,
+}
+
+s1 = serving_calculator(mock_label, 1.0)
+record("serving_calculator 1x calories",   s1.get("calories")==150.0,   f"Got {s1.get('calories')}")
+record("serving_calculator 1x protein",    s1.get("protein_g")==3.0,    f"Got {s1.get('protein_g')}")
+record("serving_calculator null preserved",s1.get("calcium_mg") is None,f"Got {s1.get('calcium_mg')}")
+record("serving_calculator _is_label_mode",s1.get("_is_label_mode")==True,"Should be True")
+
+s25 = serving_calculator(mock_label, 2.5)
+record("serving_calculator 2.5x calories",abs(s25.get("calories",0)-375.0)<0.01,f"Got {s25.get('calories')}")
+record("serving_calculator 2.5x carbs",   abs(s25.get("carbs_g",0)-50.0)<0.01, f"Got {s25.get('carbs_g')}")
+record("serving_calculator 2.5x null",    s25.get("calcium_mg") is None,"Should still be None")
+
+s01 = serving_calculator(mock_label, 0.1)   # point 9: minimum 0.1 servings
+record("serving_calculator 0.1x calories",abs(s01.get("calories",0)-15.0)<0.01,f"Got {s01.get('calories')}")
+record("serving_calculator empty input",serving_calculator({},1.0)=={},"Should be empty dict")
+
+# ─────────────────────────────────────────────────────────────
+# 9. USDA SCORING — word-overlap fixes validated without API
+# ─────────────────────────────────────────────────────────────
+print("\n" + "═"*60)
+print("SCENARIO 9: USDA scoring — tomato/basil and okra/chicken-finger fixes")
+print("═"*60)
+
+_LOW_CAL_VEG = {
+    "tomato","tomatoes","cucumber","lettuce","celery","spinach","capsicum",
+    "pepper","okra","cabbage","zucchini","radish","beet","beetroot",
+}
+_SPECIALTY = {
+    "glutinous","sticky","wild","instant","parboiled","converted",
+    "enriched","unenriched","arborio","whole grain","sprouted","fortified",
+}
+_WRONG_CAT = {
+    "cookie","cracker","cake","candy","chocolate","chips","popcorn",
+    "chicken finger","chicken fingers","fish finger","fish fingers",
+    "fish stick","fish sticks","ladyfinger cookie",
+}
+
+def _ov(q, d):
+    STOP = {"raw","cooked","fresh","dried","and","with","the","a","an",
+            "of","in","or","boiled","steamed","baked","roasted","fried","ns"}
+    qw = {w for w in q.lower().split() if w not in STOP and len(w)>2}
+    dl = d.lower()
+    if not qw: return 0.5
+    return sum(1 for w in qw if w in dl)/len(qw)
+
+def _score(query, candidates):
+    q = query.lower()
+    cooked_sig = {"cooked","boiled","steamed","fried","baked","roasted",
+                  "rice","dal","pasta","lentil","bean","curry","porridge"}
+    imp_cooked = any(w in q for w in cooked_sig)
+    is_veg     = any(v in q for v in _LOW_CAL_VEG)
+    scored = []
+    for c in candidates:
+        s=0; k=c.get("calories",0) or 0; d=c.get("_d",""); dl=d.lower()
+        ov=_ov(query,d)
+        if   ov==1.0: s+=4
+        elif ov>=0.5: s+=2
+        elif ov> 0.0: s+=1
+        else:         s-=4
+        for bad in _WRONG_CAT:
+            if bad in dl and bad not in q: s-=10; break
+        if 50<=k<=450: s+=1
+        if k>500:      s-=2
+        if k<5 and not is_veg: s-=1
+        if imp_cooked and "cooked" in dl: s+=2
+        if imp_cooked and k>300:          s-=1
+        for v in _SPECIALTY:
+            if v in dl and v not in q: s-=3; break
+        scored.append((s,c))
+    scored.sort(key=lambda x:x[0],reverse=True)
+    return scored[0][1]
+
+def mk(desc,kcal): return {"_d":desc,"calories":kcal,"_usda_description":desc}
+
+scoring_cases = [
+    ("tomatoes raw",
+     [mk("Tomatoes, red, ripe, raw",18),mk("Basil, fresh",22),mk("Tomato sauce",32)],
+     "Tomatoes", "tomato must beat basil"),
+    ("okra raw",
+     [mk("Okra, raw",33),mk("Chicken fingers, breaded",220),mk("Fish fingers",190)],
+     "Okra", "okra must beat chicken fingers"),
+    ("cucumber raw",
+     [mk("Cucumber, with peel, raw",15),mk("Cream cheese",342),mk("White bread",266)],
+     "Cucumber", "cucumber must not lose to high-cal items"),
+    ("okra raw",
+     [mk("Okra, raw",33),mk("Ladyfingers, dry",352),mk("Chicken fingers",220)],
+     "Okra", "lady finger normalized to okra must still win"),
+    ("rice white long-grain cooked",
+     [mk("Rice, white, glutinous, unenriched, cooked",406),
+      mk("Rice, white, long-grain, regular, cooked",130),
+      mk("Rice, brown, long-grain, cooked",112)],
+     "long-grain, regular", "glutinous rice must NOT win"),
+]
+
+for query, candidates, expect, note in scoring_cases:
+    best   = _score(query, candidates)
+    winner = best["_usda_description"]
+    ok     = expect.lower() in winner.lower()
+    record(f"USDA score: {note}", ok,
+           f"query='{query}' → winner='{winner}' ({best['calories']} kcal)")
+
+# ─────────────────────────────────────────────────────────────
+# 10. PORTIONS — utensil-based estimation (no API)
+# ─────────────────────────────────────────────────────────────
+print("\n" + "═"*60)
+print("SCENARIO 10: Portions — utensil weight estimation")
+print("═"*60)
+
+_UTENSIL_ML = {
+    "small katori":110,"medium katori":170,"large katori":230,
+    "small bowl":180,"medium bowl":320,"large bowl":450,
+}
+_FILL = {"25%":0.25,"50%":0.50,"75%":0.75,"full":1.00,"n/a":0.70}
+_DICT = {
+    ("roti","piece"):40,("tomato","piece"):120,("cucumber","piece"):150,
+    ("okra","piece"):6,("*","bowl"):250,("*","piece"):80,("*","cup"):240,
+    ("*","grams"):1,
+}
+
+def _to_g(food,size,unit,container="",fill="n/a"):
+    if unit in ("grams","g"): return max(1,int(round(size)))
+    for k,v in _UTENSIL_ML.items():
+        if k in container.lower():
+            return max(5,int(round(v * _FILL.get(fill,0.70) * 0.85 * size)))
+    fl = food.lower()
+    for (fk,uk),gv in _DICT.items():
+        if fk!="*" and fk in fl and uk==unit: return int(round(size*gv))
+    return int(round(size * _DICT.get(("*",unit),80)))
+
+portion_cases = [
+    ("rice",    1,"bowl","medium bowl","50%",  90, 180, "medium bowl 50%"),
+    ("dal",     1,"bowl","small katori","75%", 50, 120, "small katori 75%"),
+    ("tomato",  1,"piece","","n/a",           110, 130, "tomato per piece"),
+    ("roti",    2,"piece","","n/a",            75,  85, "2 rotis"),
+    ("cucumber",100,"grams","","n/a",          100, 100, "direct grams"),
+]
+
+for food,qty,unit,container,fill,lo,hi,note in portion_cases:
+    g  = _to_g(food,qty,unit,container,fill)
+    ok = lo <= g <= hi
+    record(f"to_grams '{food}' ({note})", ok, f"Got {g}g, expected {lo}-{hi}g")
+
 # ─────────────────────────────────────────────────────────────
 # SUMMARY
 # ─────────────────────────────────────────────────────────────
